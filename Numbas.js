@@ -1,176 +1,335 @@
 
 (async () => {
-  const host = document.querySelector('numbas-exam');
-  const root = host?.shadowRoot;
-  const exam = window.Numbas?.exam;
+  const AUTO_SUBMIT = true; // false = preview only
 
-  if (!root || !exam) {
-    console.error('Select the Numbas exam frame in DevTools.');
+  const host = document.querySelector('numbas-exam');
+  const root = host?.shadowRoot || document;
+  const exam = window.Numbas?.exam || host?.exam;
+
+  if (!exam?.questionList) {
+    console.error('No Numbas exam in this console context.');
     return;
   }
 
+  const found = new Set();
   const results = [];
-  const queued = new Map();
-  const visited = new Set();
+  const groups = new Map();
+  const choiceTypes = new Set(['1_n_2', 'm_n_2', 'm_n_x']);
 
-  function outerPart(p) {
+  function outer(p) {
     while (p?.isGap && p.parentPart) {
       p = p.parentPart;
     }
     return p;
   }
 
-  function loaded(p) {
-    const outer = outerPart(p);
-    const node = outer?.display?.html;
-
-    return !!node && root.contains(node);
+  function isLoaded(p) {
+    const html = outer(p)?.display?.html;
+    return !!html && (
+      root.contains?.(html) || html.isConnected
+    );
   }
 
-  function fallback(p) {
-    if (p.type === 'numberentry') {
-      const answer = p.getCorrectAnswer?.(p.getScope());
-      return answer ?? p.settings?.displayAnswer;
+  function done(p) {
+    return !!(
+      p.locked ||
+      p.revealed ||
+      (p.answered && p.marks > 0 && p.score >= p.marks)
+    );
+  }
+
+  function allParts(p, out) {
+    if (!p || found.has(p)) return;
+    found.add(p);
+
+    if (p.type !== 'gapfill') {
+      out.push(p);
     }
 
+    for (const child of p.gaps || []) {
+      allParts(child, out);
+    }
+
+    if (p.stepsShown) {
+      for (const step of p.steps || []) {
+        allParts(step, out);
+      }
+    }
+  }
+
+  function getAnswer(p) {
+    const s = p.settings || {};
+    const scope = typeof p.getScope === 'function'
+      ? p.getScope()
+      : undefined;
+
+    // Prefer an answer formatted for the widget.
+    const w = p.display?.correct_answer;
+
+    if (typeof w === 'function') {
+      const a = w();
+
+      if (
+        a?.valid === true &&
+        a.value !== undefined &&
+        a.value !== null &&
+        a.value !== ''
+      ) {
+        return a.value;
+      }
+    }
+
+    // Numbers, fractions, decimals, scientific notation.
+    if (p.type === 'numberentry') {
+      const a = s.displayAnswer ??
+        p.getCorrectAnswer?.(scope);
+
+      return a == null ? null : String(a).trim();
+    }
+
+    // Algebra, differentiation, graph formulas.
     if (p.type === 'jme') {
-      const s = p.settings?.correctAnswer;
+      const a = s.correctAnswer ||
+        p.getCorrectAnswer?.(scope);
 
-      if (typeof s === 'string' && s.trim()) {
-        return s;
+      return typeof a === 'string' ? a.trim() : null;
+    }
+
+    // Text entry, T/F truth tables, pattern matching.
+    if (p.type === 'patternmatch') {
+      const a = s.displayAnswer ||
+        p.getCorrectAnswer?.(scope);
+
+      return typeof a === 'string' ? a : null;
+    }
+
+    // Multiple choice, checkboxes and matching grids.
+    if (choiceTypes.has(p.type)) {
+      const a = s.maxMatrix ||
+        p.getCorrectAnswer?.(scope);
+
+      if (
+        !Array.isArray(a) ||
+        a.length !== p.numAnswers ||
+        a.some(row =>
+          !Array.isArray(row) ||
+          row.length !== p.numChoices
+        )
+      ) {
+        return null;
       }
 
-      const tree = p.getCorrectAnswer?.(p.getScope());
+      return a.map(row => row.map(Boolean));
+    }
 
-      if (typeof tree === 'string') {
-        return tree;
+    // Matrix entry.
+    if (p.type === 'matrix') {
+      const a = p.getCorrectAnswer?.(scope);
+
+      return Array.isArray(a) &&
+        a.every(row => Array.isArray(row))
+        ? a
+        : null;
+    }
+
+    // Custom question types.
+    if (p.is_custom_part_type) {
+      const widget = p.input_widget?.();
+      const a = p.input_options?.()?.correctAnswer ??
+        p.getCorrectAnswer?.(scope);
+
+      // Quantity with units and typed custom answers.
+      if (['string', 'number', 'quantity'].includes(widget)) {
+        return (
+          typeof a === 'string' ||
+          typeof a === 'number'
+        ) ? String(a) : null;
       }
 
-      if (tree && window.Numbas?.jme?.display?.treeToJME) {
-        return Numbas.jme.display.treeToJME(
-          tree, {}, p.getScope()
-        );
+      // Custom mathematical expression.
+      if (widget === 'jme') {
+        if (typeof a === 'string') return a;
+
+        const printer =
+          window.Numbas?.jme?.display?.treeToJME;
+
+        return a && printer
+          ? printer(a, {}, scope)
+          : null;
+      }
+
+      // Custom radio buttons and dropdowns.
+      if (['radios', 'dropdown'].includes(widget)) {
+        return Number.isInteger(a) && a >= 0
+          ? a
+          : null;
+      }
+
+      // Custom checkboxes.
+      if (widget === 'checkboxes') {
+        return Array.isArray(a) &&
+          a.every(v => typeof v === 'boolean')
+          ? a
+          : null;
+      }
+
+      // Custom matrices.
+      if (widget === 'matrix') {
+        return Array.isArray(a) ? a : null;
       }
     }
 
     return null;
   }
 
-  function scan(p) {
-    if (!p || visited.has(p)) return;
-    visited.add(p);
+  // Collect every loaded question, including offscreen parts.
+  const parts = [];
 
-    if (p.type === 'gapfill') {
-      (p.gaps || []).forEach(scan);
-      (p.steps || []).forEach(scan);
-      return;
+  for (const question of exam.questionList) {
+    for (const p of question.parts || []) {
+      allParts(p, parts);
     }
+  }
 
-    (p.steps || []).forEach(scan);
-
-    if (
-      !loaded(p) ||
-      !p.display ||
-      p.locked ||
-      p.revealed ||
-      (p.answered && p.marks > 0 && p.score >= p.marks)
-    ) {
-      return;
-    }
+  // Process answers.
+  for (const p of parts) {
+    if (!isLoaded(p)) continue;
 
     const row = {
-      question: p.question?.name,
-      part: p.name || p.path,
-      type: p.type
+      question: p.question?.name || '',
+      part: p.name || p.path || '',
+      type: p.type,
+      status: ''
     };
 
     results.push(row);
 
-    try {
-      const native =
-        typeof p.display.correct_answer === 'function'
-          ? p.display.correct_answer()
-          : null;
+    if (done(p)) {
+      row.status = 'Already complete / locked';
+      continue;
+    }
 
-      const value =
-        native?.valid && native.value != null
-          ? native.value
-          : fallback(p);
+    try {
+      const a = getAnswer(p);
 
       if (
-        value == null ||
-        value === '' ||
-        (Array.isArray(value) && !value.length)
+        a == null ||
+        a === '' ||
+        (Array.isArray(a) && !a.length)
       ) {
-        row.status = 'Skipped: no widget-compatible expected answer';
-        return;
+        row.status =
+          'Unsupported or no representative answer';
+        continue;
       }
 
-      p.display.input_answer({
-        valid: true,
-        value,
-        warnings: []
-      });
+      row.answer = (
+        typeof a === 'object'
+          ? JSON.stringify(a)
+          : String(a)
+      ).slice(0, 120);
 
-      row.status = native?.valid
-        ? 'Entered (widget answer)'
-        : 'Entered (fallback)';
+      if (AUTO_SUBMIT) {
+        // Newer Numbas answer widgets.
+        if (typeof p.display?.input_answer === 'function') {
+          p.display.input_answer({
+            valid: true,
+            value: a,
+            warnings: []
+          });
 
-      row.value = typeof value === 'object'
-        ? JSON.stringify(value).slice(0, 100)
-        : String(value).slice(0, 100);
+        // Classic Numbas runtime.
+        } else if (typeof p.storeAnswer === 'function') {
+          p.storeAnswer(a);
 
-      const parent = outerPart(p);
+        } else {
+          row.status = 'No answer-entry method';
+          continue;
+        }
 
-      if (!queued.has(parent)) {
-        queued.set(parent, []);
+        row.status = 'Entered';
+
+        // Submit the parent gap-fill once.
+        const parent = outer(p);
+
+        if (!groups.has(parent)) {
+          groups.set(parent, []);
+        }
+
+        groups.get(parent).push(row);
+
+      } else {
+        row.status = 'Preview';
       }
 
-      queued.get(parent).push(row);
-
-    } catch (err) {
-      row.status = 'Error: ' + err.message;
+    } catch (e) {
+      row.status = 'Error: ' + e.message;
     }
   }
 
-  for (const question of exam.questionList || []) {
-    for (const part of question.parts || []) {
-      scan(part);
+  // Submit all successfully staged answers.
+  if (AUTO_SUBMIT) {
+    for (const [p, rows] of groups) {
+      try {
+        if (typeof p.submit === 'function') {
+          const returned = p.submit();
+
+          if (returned?.then) {
+            await returned;
+          }
+
+        } else if (
+          typeof p.display?.controls?.submit === 'function'
+        ) {
+          const returned = p.display.controls.submit();
+
+          if (returned?.then) {
+            await returned;
+          }
+
+        } else {
+          rows.forEach(r => {
+            r.status = 'No submission method';
+          });
+        }
+
+      } catch (e) {
+        rows.forEach(r => {
+          r.status = 'Submit error: ' + e.message;
+        });
+      }
     }
   }
 
-  for (const [p, rows] of queued) {
-    try {
-      const r = p.display.controls.submit();
-
-      if (r?.then) {
-        await r;
-      }
-
-    } catch (err) {
-      for (const row of rows) {
-        row.status = 'Save failed: ' + err.message;
-      }
-    }
-  }
-
+  // Display answer-processing report.
   console.table(results);
 
   console.log(
-    `Loaded fields checked: ${results.length}; ` +
-    `parts submitted: ${queued.size}`
+    'Loaded candidate parts:', results.length,
+    '| Submitted parent parts:', groups.size
   );
 
-  setTimeout(() => {
-    console.table([...queued].map(([p]) => ({
-      question: p.question?.name,
-      part: p.name,
-      score: `${p.score}/${p.marks}`,
-      fullMarks: !!(
-        p.answered &&
-        p.marks > 0 &&
-        p.score >= p.marks
-      )
-    })));
-  }, 1200);
+  // Verify actual marks.
+  if (AUTO_SUBMIT) {
+    setTimeout(() => {
+      const scores = [...groups.keys()].map(p => ({
+        question: p.question?.name || '',
+        part: p.name || p.path,
+        score: `${p.score}/${p.marks}`,
+        fullMarks: !!(
+          p.answered &&
+          p.marks > 0 &&
+          p.score >= p.marks
+        )
+      }));
+
+      console.table(scores);
+
+      console.log(
+        'Full marks:',
+        scores.filter(s => s.fullMarks).length,
+        '/',
+        scores.length
+      );
+    }, 1200);
+  }
 })();
